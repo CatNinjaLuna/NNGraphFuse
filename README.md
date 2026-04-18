@@ -177,6 +177,41 @@ The passes implemented here correspond directly to what TRT's graph optimizer do
 
 ---
 
+## Milestones
+
+```
+✅ Phase 1 — Project Setup
+   ✅ Folder structure
+   ✅ Virtual environment
+   ✅ ResNet-50 exported to ONNX
+
+✅ Phase 2 — Graph IR
+   ✅ ONNX parser
+   ✅ Op summary
+   ✅ Discovered BN folding
+
+✅ Phase 3 — Optimization Passes
+   ✅ Conv + Relu Fusion (33 nodes eliminated)
+   ⬜ Constant Folding
+   ⬜ Dead Node Elimination
+
+⬜ Phase 4 — Graph Visualization
+   ⬜ Before/after graph diff (networkx)
+   ⬜ Latency waterfall chart
+
+⬜ Phase 5 — TensorRT Benchmark (university cluster)
+   ⬜ Baseline TRT engine build
+   ⬜ Benchmark each pass individually
+   ⬜ Fill in benchmark table in README
+
+⬜ Phase 6 — Polish
+   ⬜ pipeline.py (runs all passes end to end)
+   ⬜ requirements.txt finalized
+   ⬜ GitHub README final
+```
+
+---
+
 ## Model
 
 ResNet-50 (ImageNet pretrained via `torchvision`). Chosen because its repeating residual block structure produces clear Conv+Relu fusion opportunities that are easy to identify, measure, and explain.
