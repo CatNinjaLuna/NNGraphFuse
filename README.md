@@ -215,3 +215,33 @@ The passes implemented here correspond directly to what TRT's graph optimizer do
 ## Model
 
 ResNet-50 (ImageNet pretrained via `torchvision`). Chosen because its repeating residual block structure produces clear Conv+Relu fusion opportunities that are easy to identify, measure, and explain.
+
+---
+
+## Concepts Covered
+
+This project is designed to build working answers to the following inference engineering interview topics.
+
+---
+
+**Operator fusion: when does TRT fuse automatically vs. when do you force it?**
+
+TRT automatically fuses patterns it has built-in support for — Conv+BN+Relu, element-wise ops after Conv, and select attention patterns. This happens internally during `builder.build_engine()`. You force fusion when TRT does not recognize the pattern — custom ops, unusual topology, or ops that cross plugin boundaries — either by writing a TensorRT plugin or by pre-optimizing the graph before TRT sees it. NNGraphFuse implements the latter: a pre-TRT fusion pass that rewires the graph so TRT receives a cleaner input.
+
+---
+
+**Horizontal vs. vertical fusion — Conv+BN+Relu as the canonical example**
+
+Vertical fusion merges ops along the data flow path, one feeding into the next (Conv → Relu). This is what NNGraphFuse implements. Horizontal fusion merges ops that run in parallel on independent data — parallel Conv branches in Inception, or MoE expert layers. Conv+BN+Relu is the canonical vertical fusion example because it appears in nearly every CNN block and the memory bandwidth savings are directly measurable. In ResNet-50, BN was already folded into Conv weights by the ONNX exporter — discovered by inspecting the IR — making Conv+Relu the actual fusion target.
+
+---
+
+**Structured vs. unstructured pruning — Ampere/Hopper 2:4 sparsity**
+
+Unstructured pruning zeros individual weights anywhere in the matrix. It achieves high sparsity but produces irregular memory access patterns that standard GPU hardware cannot exploit efficiently. Structured pruning removes entire filters or channels, producing a smaller dense matrix that hardware handles natively — easier to deploy but coarser grained. NVIDIA's 2:4 structured sparsity (Ampere+) sits between the two: exactly 2 of every 4 consecutive weights must be zero, producing regular enough structure for Sparse Tensor Cores to decompress and multiply in one step, delivering ~2x throughput at exactly 50% sparsity. The tradeoff: requires retraining or fine-tuning with the sparsity constraint enforced — you cannot prune a dense model post-hoc and expect the hardware speedup.
+
+---
+
+**The roofline model applied to fused vs. unfused graphs**
+
+The roofline model bounds kernel performance by two limits: peak compute (FLOPS) and peak memory bandwidth (GB/s). Relu is almost purely memory bound — minimal arithmetic, full DRAM read and write. Unfused, it sits far left on the roofline: bandwidth limited, compute underutilized. Conv is more compute bound — high arithmetic intensity from multiply-accumulates. Fused, the Relu executes inside the Conv kernel: intermediate values stay in registers, no additional DRAM transaction occurs, and the fused kernel's arithmetic intensity shifts right toward the compute roof. Nsight Systems confirms this directly — fused kernels show higher arithmetic intensity and fewer memory transactions per inference pass.
