@@ -157,6 +157,26 @@ def run_constant_folding(ir: dict) -> dict:
     folded_count = 0
     kept_nodes = []
 
+    # --- Step 1b: Absorb inline Constant nodes into const_values --------------
+    # The ONNX exporter sometimes emits constants as Constant nodes rather than
+    # initializers. Harvest them first so the main scan can fold their consumers.
+    remaining_nodes = []
+    for node in ir["nodes"]:
+       if node["op"] == "Constant":
+          attr = node["attrs"].get("value")
+          if attr is not None:
+                from onnx import numpy_helper
+                arr = numpy_helper.to_array(attr.t)
+                const_values[node["outputs"][0]] = arr
+                folded_count += 1   
+          # Don't append to remaining_nodes — Constant nodes are now absorbed
+       else:
+          remaining_nodes.append(node)
+
+    # Replace node list with Constant nodes removed before the main scan
+    ir = {**ir, "nodes": remaining_nodes}
+
+
     # --- Step 2: Single forward scan (topological order) --------------------
     # For each node: are ALL inputs already in const_values?
     # If yes → evaluate with numpy, register output into const_values, drop node.
@@ -280,7 +300,8 @@ if __name__ == "__main__":
     print("=== Constant Folding Pass ===\n")
 
     # Load IR (post-fusion if you've already run fusion.py)
-    ir = load_ir("models/resnet50.onnx")
+    #ir = load_ir("models/resnet50.onnx")
+    ir = load_ir("models/mobilenetv2_normalized.onnx")
 
     print_op_summary(ir, label="(before folding)")
 
@@ -292,3 +313,83 @@ if __name__ == "__main__":
     # Optionally chain: save folded IR for next pass
     # from passes.dead_node import run_dead_node_elimination
     # ir_final = run_dead_node_elimination(ir_folded)
+
+
+    '''
+    (venv) (base) carolina1650@Carolinas-MacBook-Pro NNGraphFuse % python -m passes.constant_fold
+=== Constant Folding Pass ===
+
+✅ Loaded 172 nodes, 108 initializers from models/mobilenetv2_normalized.onnx
+
+Op summary (before folding)
+  Op                    Count
+  ----------------------------
+  Constant                 70
+  Conv                     52
+  Clip                     35
+  Add                      10
+  Sub                       1
+  Div                       1
+  GlobalAveragePool         1
+  Flatten                   1
+  Gemm                      1
+  ────────────────────────────
+  Total                   172
+
+[constant_fold] 172 nodes → 172 nodes  (0 folded)
+
+Op summary (after folding)
+  Op                    Count
+  ----------------------------
+  Constant                 70
+  Conv                     52
+  Clip                     35
+  Add                      10
+  Sub                       1
+  Div                       1
+  GlobalAveragePool         1
+  Flatten                   1
+  Gemm                      1
+  ────────────────────────────
+  Total                   172
+    '''
+
+'''
+after adding 1-b pre-sweep:
+(venv) (base) carolina1650@Carolinas-MacBook-Pro NNGraphFuse % python -m passes.constant_fold
+=== Constant Folding Pass ===
+
+✅ Loaded 172 nodes, 108 initializers from models/mobilenetv2_normalized.onnx
+
+Op summary (before folding)
+  Op                    Count
+  ----------------------------
+  Constant                 70
+  Conv                     52
+  Clip                     35
+  Add                      10
+  Sub                       1
+  Div                       1
+  GlobalAveragePool         1
+  Flatten                   1
+  Gemm                      1
+  ────────────────────────────
+  Total                   172
+
+[constant_fold] 172 nodes → 102 nodes  (70 folded)
+
+Op summary (after folding)
+  Op                    Count
+  ----------------------------
+  Conv                     52
+  Clip                     35
+  Add                      10
+  Sub                       1
+  Div                       1
+  GlobalAveragePool         1
+  Flatten                   1
+  Gemm                      1
+  ────────────────────────────
+
+
+'''
