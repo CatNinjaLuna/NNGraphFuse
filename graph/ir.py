@@ -14,111 +14,155 @@
 # This is the same pattern used by production compilers:
 #   ONNX (file format) → IR (in-memory workable graph) → passes → ONNX
 #
-# OUTPUT: a dict of {node_id: {op, inputs, outputs, attrs}}
-# Consumed by passes/fusion.py and other optimization passes.
+# OUTPUT:
+#   {
+#     "nodes":        [{"name", "op", "inputs", "outputs", "attrs"}, ...],
+#     "initializers": {name -> np.ndarray},   ← weights + constants
+#     "inputs":       [graph input names],
+#     "outputs":      [graph output names],
+#   }
+#
+# Consumed by passes/fusion.py, passes/constant_fold.py, and future passes.
 
 import onnx
+import numpy as np
+from onnx import numpy_helper
 
-def load_graph(onnx_path):
+
+def load_ir(onnx_path: str) -> dict:
     """
-    Parse ONNX model into a workable IR.
-    Returns a dict of {node_id: node_info}
+    Parse ONNX model into a workable IR dict.
+
+    Replaces the old load_graph() which returned {node_id: node_info}.
+    The new structure is list-based for nodes (preserves topological order)
+    and dict-based for initializers (O(1) lookup by name).
     """
     model = onnx.load(onnx_path)
     graph = model.graph
 
-    ir = {}
+    # --- Nodes (topological order guaranteed by ONNX spec) ------------------
+    nodes = []
     for i, node in enumerate(graph.node):
-        node_id = f"node_{i}"
-        ir[node_id] = {
+        nodes.append({
+            "name":    node.name or f"node_{i}",
             "op":      node.op_type,
             "inputs":  list(node.input),
             "outputs": list(node.output),
-            "attrs":   {a.name: a for a in node.attribute}
-        }
+            "attrs":   {a.name: a for a in node.attribute},
+        })
 
-    print(f"✅ Loaded {len(ir)} nodes from {onnx_path}")
+    # --- Initializers: weights, biases, normalization scalars ---------------
+    # These are compile-time constants — the constant folding pass needs them
+    # as numpy arrays keyed by name.
+    initializers = {
+        t.name: numpy_helper.to_array(t)
+        for t in graph.initializer
+    }
+
+    # --- Graph-level inputs / outputs ---------------------------------------
+    # inputs[0] is typically the image tensor ('input'); the rest are weights
+    # that are also listed as initializers (ONNX convention).
+    inputs  = [inp.name for inp in graph.input]
+    outputs = [out.name for out in graph.output]
+
+    ir = {
+        "nodes":        nodes,
+        "initializers": initializers,
+        "inputs":       inputs,
+        "outputs":      outputs,
+    }
+
+    print(f"✅ Loaded {len(nodes)} nodes, {len(initializers)} initializers from {onnx_path}")
     return ir
 
 
-def summarize(ir):
-    """Print a count of each op type in the graph."""
+# ---------------------------------------------------------------------------
+# Legacy shim — keeps existing passes/fusion.py working without changes
+# ---------------------------------------------------------------------------
+
+def load_graph(onnx_path: str) -> dict:
+    """
+    Deprecated. Returns old {node_id: node_info} format.
+    Use load_ir() for all new passes.
+    """
+    ir = load_ir(onnx_path)
+    return {
+        f"node_{i}": node
+        for i, node in enumerate(ir["nodes"])
+    }
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def summarize(ir: dict):
+    """Print a count of each op type. Accepts both old and new IR formats."""
     from collections import Counter
-    op_counts = Counter(v["op"] for v in ir.values())
+
+    # Handle both old dict-of-dicts and new list-of-dicts format
+    if isinstance(ir, list) or "nodes" in ir:
+        nodes = ir["nodes"] if isinstance(ir, dict) else ir
+        op_counts = Counter(n["op"] for n in nodes)
+    else:
+        op_counts = Counter(v["op"] for v in ir.values())
+
     print("\n📊 Op type summary:")
     for op, count in op_counts.most_common():
         print(f"   {op:<20} {count}")
 
 
 if __name__ == "__main__":
-    ir = load_graph("models/resnet50.onnx")
+    ir = load_ir("models/resnet50.onnx")
 
     # Print first 10 nodes
     print("\n🔍 First 10 nodes:")
-    for k, v in list(ir.items())[:10]:
-        print(f"  {k}: op={v['op']}")
-        print(f"       inputs={v['inputs']}")
-        print(f"       outputs={v['outputs']}")
+    for node in ir["nodes"][:10]:
+        print(f"  {node['name']}: op={node['op']}")
+        print(f"       inputs={node['inputs']}")
+        print(f"       outputs={node['outputs']}")
 
     summarize(ir)
 
+    print(f"\n📦 Initializers: {len(ir['initializers'])} tensors")
+    print(f"   Sample keys: {list(ir['initializers'].keys())[:5]}")
 
-'''
-(venv) (base) carolina1650@Carolinas-MacBook-Pro NNGraphFuse % python graph/ir.py
-✅ Loaded 124 nodes from models/resnet50.onnx
+    '''
+    === Constant Folding Pass ===
 
-🔍 First 10 nodes:
-  node_0: op=Shape
-       inputs=['input']
-       outputs=['val_0']
-  node_1: op=Conv
-       inputs=['input', 'conv1.weight', 'conv1.weight_bias']
-       outputs=['getitem']
-  node_2: op=Relu
-       inputs=['getitem']
-       outputs=['relu']
-  node_3: op=MaxPool
-       inputs=['relu']
-       outputs=['max_pool2d']
-  node_4: op=Conv
-       inputs=['max_pool2d', 'layer1.0.conv1.weight', 'layer1.0.conv1.weight_bias']
-       outputs=['getitem_3']
-  node_5: op=Relu
-       inputs=['getitem_3']
-       outputs=['relu_1']
-  node_6: op=Conv
-       inputs=['relu_1', 'layer1.0.conv2.weight', 'layer1.0.conv2.weight_bias']
-       outputs=['getitem_6']
-  node_7: op=Relu
-       inputs=['getitem_6']
-       outputs=['relu_2']
-  node_8: op=Conv
-       inputs=['relu_2', 'layer1.0.conv3.weight', 'layer1.0.conv3.weight_bias']
-       outputs=['getitem_9']
-  node_9: op=Conv
-       inputs=['max_pool2d', 'layer1.0.downsample.0.weight', 'layer1.0.downsample.0.weight_bias']
-       outputs=['getitem_12']
+✅ Loaded 124 nodes, 110 initializers from models/resnet50.onnx
 
-📊 Op type summary:
-   Conv                 53
-   Relu                 49
-   Add                  16
-   Shape                1
-   MaxPool              1
-   ReduceMean           1
-   Concat               1
-   Reshape              1
-   Gemm                 1
+Op summary (before folding)
+  Op                    Count
+  ----------------------------
+  Conv                     53
+  Relu                     49
+  Add                      16
+  Shape                     1
+  MaxPool                   1
+  ReduceMean                1
+  Concat                    1
+  Reshape                   1
+  Gemm                      1
+  ────────────────────────────
+  Total                   124
 
-no BatchNorm in the graph. 
-That's because PyTorch's ONNX exporter already folded BN into the Conv weights during export. 
-The pattern we're aiming is now Conv → Relu not Conv → BN → Relu
+[constant_fold] 124 nodes → 124 nodes  (0 folded)
 
-- 53 Conv nodes + 49 Relu nodes — most Convs are already paired with a Relu
-- 16 Add nodes — those are the residual skip connections merging branches
-- The actual fusion opportunity is Conv + Relu, which is still valid and impactful
-
-When I loaded the graph I discovered BN was already folded into Conv weights by the exporter
-so I adapted the fusion pass to target Conv+Relu instead
-moving on to work on passes/fushion.py 
-'''
+Op summary (after folding)
+  Op                    Count
+  ----------------------------
+  Conv                     53
+  Relu                     49
+  Add                      16
+  Shape                     1
+  MaxPool                   1
+  ReduceMean                1
+  Concat                    1
+  Reshape                   1
+  Gemm                      1
+  ────────────────────────────
+  Total                   124
+    
+    
+    '''
