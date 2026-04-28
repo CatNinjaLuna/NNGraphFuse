@@ -1,6 +1,6 @@
 # NNGraphFuse
 
-** Building the graph optimization passes that live inside TensorRT: operator fusion, constant folding, and dead node elimination, on ResNet-50 and MobileNetV2, to see what the compiler does internally before generating GPU kernels.**
+**Building the graph optimization passes that live inside TensorRT: operator fusion, constant folding, and dead node elimination, on ResNet-50 and MobileNetV2, to see what the compiler does internally before generating GPU kernels.**
 
 ---
 
