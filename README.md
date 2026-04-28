@@ -1,6 +1,6 @@
 # NNGraphFuse
 
-**Compiler-style graph optimization passes for neural network inference, benchmarked end-to-end on real image data using TensorRT.**
+** Building the graph optimization passes that live inside TensorRT: operator fusion, constant folding, and dead node elimination, on ResNet-50 and MobileNetV2, to see what the compiler does internally before generating GPU kernels.**
 
 ---
 
@@ -123,8 +123,6 @@ Removes identity ops, unused outputs, and no-op reshapes that accumulate during 
 ---
 
 ## Benchmark Results
-
-_(to be updated after university cluster runs)_
 
 | Model       | Pass                | Nodes Before | Nodes After | Eliminated |
 | ----------- | ------------------- | ------------ | ----------- | ---------- |
