@@ -162,9 +162,9 @@ Total            102      102
 
 | Model       | Pass                  | Nodes Before | Nodes After | Eliminated |
 | ----------- | --------------------- | ------------ | ----------- | ---------- |
-| ResNet-50   | Conv+Relu Fusion      | 124          | 91          | 33         |
-| MobileNetV2 | Constant Folding      | 172          | 102         | 70         |
-| ResNet-50   | Dead Node Elimination | 124          | 124         | 0 ✓        |
+| ResNet-50   | Conv+Relu Fusion      | 124          | 91          | 33 (27%)   |
+| ResNet-50   | Dead Node Elimination | 91           | 91          | 0 ✓        |
+| MobileNetV2 | Constant Folding      | 172          | 102         | 70 (41%)   |
 | MobileNetV2 | Dead Node Elimination | 102          | 102         | 0 ✓        |
 | ResNet-50   | Baseline TRT (FP32)   | —            | —           | TBD        |
 | ResNet-50   | + Fusion (FP32)       | —            | —           | TBD        |
@@ -188,10 +188,10 @@ NNGraphFuse/
 │   ├── constant_fold.py     # constant folding pass (with Constant node pre-sweep)
 │   └── dead_node.py         # dead node elimination pass (iterative, convergence-based)
 ├── benchmark/
-│   └── runner.py            # latency/throughput/memory profiling
+│   └── runner.py            # latency/throughput/memory profiling (stubbed, pending A100)
 ├── export_model.py          # ResNet-50 → ONNX export
 ├── export_mobilenet.py      # MobileNetV2 (normalized) → ONNX export
-├── pipeline.py              # main entry point
+├── pipeline.py              # main entry point — runs all passes, prints summary
 └── requirements.txt
 ```
 
@@ -213,17 +213,15 @@ python export_mobilenet.py        # MobileNetV2 with baked-in normalization
 # 3. Load and inspect the graph IR
 python graph/ir.py
 
-# 4. Run Conv+Relu fusion pass (ResNet-50)
-python -m passes.fusion
+# 4. Run individual passes
+python -m passes.fusion           # Conv+Relu fusion (ResNet-50)
+python -m passes.constant_fold    # constant folding (MobileNetV2)
+python -m passes.dead_node        # dead node elimination (both models)
 
-# 5. Run constant folding pass (MobileNetV2)
-python -m passes.constant_fold
-
-# 6. Run dead node elimination pass (both models)
-python -m passes.dead_node
-
-# 7. Run full optimization pipeline + benchmark (requires GPU)
-python pipeline.py
+# 5. Run full optimization pipeline
+python pipeline.py                # both models
+python pipeline.py --model resnet
+python pipeline.py --model mobilenet
 ```
 
 ---
@@ -283,8 +281,8 @@ The passes implemented here correspond directly to what TRT's graph optimizer do
    ⬜ Benchmark each pass individually
    ⬜ Fill in benchmark table
 
-⬜ Phase 6 — Polish
-   ⬜ pipeline.py (runs all passes end to end)
+✅ Phase 6 — Polish
+   ✅ pipeline.py (runs all passes end to end, --model flag, summary table)
    ⬜ requirements.txt finalized
    ⬜ GitHub README final
 ```
