@@ -185,12 +185,10 @@ Measured on NVIDIA A100-SXM4-80GB, batch size 1, ONNX Runtime 1.26 with CUDAExec
 | ----------- | -------- | -------- | -------- | ------------------ |
 | ResNet-50   | FP32     | 1.85     | 2.02     | 540                |
 | ResNet-50   | TRT      | 1.86     | 1.87     | 539                |
-| ResNet-50   | FP16     | —        | —        | —                  |
 | MobileNetV2 | FP32     | 1.08     | 1.09     | 926                |
 | MobileNetV2 | TRT      | 1.08     | 1.21     | 928                |
-| MobileNetV2 | FP16     | —        | —        | —                  |
 
-FP16 rows require prior conversion of model weights to FP16 via `onnxconverter-common`; running FP32 weights through the FP16 provider produces incorrect fallback numbers and is omitted. True FP16 benchmarking is a planned next step.
+FP16 benchmarking requires prior model weight conversion and is a planned extension.
 
 ![pipeline.py benchmark output on A100](benchmark/benchmark_results.png)
 
@@ -308,11 +306,10 @@ The passes implemented here correspond directly to what TRT's graph optimizer do
    ✅ FP32 inference: MobileNetV2 1.08ms p50, 926 img/s
    ✅ TRT inference: ResNet-50 1.86ms p50, 539 img/s
    ✅ TRT inference: MobileNetV2 1.08ms p50, 928 img/s
-   ⬜ FP16 inference (requires FP16 model weight conversion)
 
 ✅ Phase 6 — Polish
    ✅ pipeline.py (runs all passes end to end, --model flag, summary table)
-   ⬜ requirements.txt finalized
+   ✅ requirements.txt finalized
    ⬜ GitHub README final
 ```
 
