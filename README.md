@@ -1,267 +1,355 @@
-# benchmark/runner.py
+# NNGraphFuse
 
-#
+**Building the graph optimization passes that live inside TensorRT: operator fusion, constant folding, and dead node elimination, on ResNet-50 and MobileNetV2, to see what the compiler does internally before generating GPU kernels.**
 
-# ROLE: Pipeline Step 5 — GPU Latency & Throughput Benchmark
+---
 
-#
+## What it does
 
-# Runs the optimized IR through ONNX Runtime on CUDA and measures:
+NNGraphFuse loads a neural network's computation graph (ONNX), parses it into a custom IR, applies a sequence of optimization passes (operator fusion, constant folding, dead node elimination), then rebuilds a TensorRT engine and benchmarks latency improvement on real image inference.
 
-# - Latency p50 / p99 (ms)
+The core idea: the same computation graph can run significantly faster if you rewrite it before handing it to the runtime. NNGraphFuse makes each optimization pass explicit and measurable.
 
-# - Throughput (images/sec)
+---
 
-# - GPU memory usage (MB)
+## Why this exists
 
-#
+TensorRT is a graph compiler. It takes a model graph, rewrites it for efficiency, and generates GPU kernels. This project implements a simplified version of that pipeline from scratch: not to replace TensorRT, but to understand it from the inside.
 
-# PROVIDERS BENCHMARKED:
+Building the passes manually forces the question: _why does fusing Conv+Relu matter?_ The answer shows up in the benchmark numbers.
 
-# FP32 — CUDAExecutionProvider, full precision
+---
 
-# FP16 — CUDAExecutionProvider, half precision
+## Pipeline
 
-# TRT — TensorrtExecutionProvider (ORT's built-in TRT integration)
+```
+JPEG Image Input
+      ↓
+Preprocessing  (resize → normalize → NCHW tensor)
+      ↓
+ONNX Graph Loader
+      ↓
+Custom IR  (list-based node graph + initializer dict)
+      ↓
+Optimization Passes
+  ├── Conv + Relu Fusion
+  ├── Constant Folding  (with Constant node pre-sweep)
+  └── Dead Node Elimination  (iterative, convergence-based)
+      ↓
+ONNX Runtime GPU Inference  (CUDAExecutionProvider / TensorrtExecutionProvider)
+      ↓
+Benchmark Report  (latency p50/p99, throughput, memory, node count)
+```
 
-#
+---
 
-# METHODOLOGY:
+## Optimization Passes
 
-# 50 warmup runs — allow GPU to reach steady-state clock, fill caches
+### Conv + Relu Fusion ✅
 
-# 200 timed runs — collect latency distribution
+ResNet-50 exports with BatchNorm already folded into Conv weights by the ONNX exporter, discovered by inspecting the IR directly. The dominant fusion target is therefore Conv + Relu.
 
-# p50/p99 — percentile latencies, robust to outliers
+The pass scans the IR for Conv nodes whose output feeds directly into a Relu, rewires the Conv to produce the Relu's output, and removes the Relu node. Of 49 Relu nodes in the graph, 33 are fused. The remaining 16 follow Add nodes (residual branch merges) rather than Conv nodes and are correctly skipped.
 
-# throughput — 1000 / p50_ms \* batch_size (images/sec)
+**Result: 124 nodes → 91 nodes (33 Relu nodes eliminated)**
 
-# GPU memory — peak allocated MB during inference
+```
+Op type summary — before vs after fusion (ResNet-50):
 
-#
+               Before    After
+Conv              53       53
+Relu              49       16    ← 33 fused into Conv
+Add               16       16
+Shape              1        1
+MaxPool            1        1
+ReduceMean         1        1
+Concat             1        1
+Reshape            1        1
+Gemm               1        1
+─────────────────────────────
+Total            124       91
+```
 
-# USAGE:
+Without fusion, each op is a separate kernel launch: the intermediate tensor between Conv and Relu gets written to DRAM and read back. Fusing them means the Relu runs inside the same kernel, intermediate values stay in registers or L2 cache, and never touch DRAM.
 
-# Called automatically by pipeline.py.
+![Conv + Relu Fusion — ResNet-50](images/graphs/resnet50_fusion.png)
 
-# Standalone: python -m benchmark.runner
+---
 
-import time
-import numpy as np
+### Constant Folding ✅
 
-# ---------------------------------------------------------------------------
+Scans the IR for nodes whose inputs are all compile-time constants, evaluates them with numpy at compile time, and removes them from the graph. TRT never sees these nodes during engine build.
 
-# GPU memory helper
+**Model:** MobileNetV2 with ImageNet normalization baked into the ONNX graph via `register_buffer()`.
 
-# ---------------------------------------------------------------------------
+**Result: 172 nodes → 102 nodes (70 Constant nodes eliminated)**
 
-def \_gpu_memory_mb() -> float:
-"""Return current GPU peak allocated memory in MB."""
-try:
-import torch
-return torch.cuda.max_memory_allocated() / 1024 \*\* 2
-except Exception:
-return 0.0
+```
+Op type summary — before vs after folding (MobileNetV2):
 
-def \_reset_gpu_memory():
-try:
-import torch
-torch.cuda.reset_peak_memory_stats()
-except Exception:
-pass
+               Before    After
+Constant          70        0    ← 70 absorbed by pre-sweep
+Conv              52       52
+Clip              35       35
+Add               10       10
+Sub                1        1
+Div                1        1
+GlobalAvgPool      1        1
+Flatten            1        1
+Gemm               1        1
+─────────────────────────────
+Total            172      102
+```
 
-# ---------------------------------------------------------------------------
+**Key finding: two representations of constants in ONNX.** The ONNX exporter can represent compile-time constants either as graph initializers (the initializer table) or as inline `Constant` nodes in the node list. A naive pass that only seeds from initializers misses the inline nodes entirely. The fix is a pre-sweep that harvests all `Constant` nodes into the constant value table before the main scan runs, which is standard in production compilers like TorchInductor and XLA.
 
-# Single provider benchmark
+**Why Sub and Div remain:** Normalization ops (`x - mean`, `x / std`) take `input` (the live image tensor) as their first operand. They touch runtime data by definition and cannot be folded. Keeping them is correct behavior.
 
-# ---------------------------------------------------------------------------
+![Constant Folding — MobileNetV2](images/graphs/mobilenet_fold.png)
 
-def \_benchmark_provider(
-onnx_path: str,
-providers: list,
-provider_options: list,
-input_name: str,
-dummy_input: np.ndarray,
-warmup: int = 50,
-runs: int = 200,
-) -> dict:
-"""
-Run warmup + timed inference loop for one provider configuration.
-Returns dict with p50, p99, throughput, gpu_mem_mb.
-"""
-import onnxruntime as ort
+---
 
-    sess_options = ort.SessionOptions()
-    sess_options.log_severity_level = 3  # suppress warnings
+### Dead Node Elimination ✅
 
-    try:
-        sess = ort.InferenceSession(
-            onnx_path,
-            sess_options=sess_options,
-            providers=providers,
-            provider_options=provider_options,
-        )
-    except Exception as e:
-        return {"error": str(e)}
+Scans the IR for nodes whose outputs are consumed by no other node and are not graph-level outputs. Runs iteratively until convergence so that chains of dead nodes (A → B → C, all dead) are fully removed in successive rounds.
 
-    # Warmup
-    for _ in range(warmup):
-        sess.run(None, {input_name: dummy_input})
+**Result: 0 nodes eliminated on both ResNet-50 and MobileNetV2 post-fold.**
 
-    # Timed runs
-    _reset_gpu_memory()
-    latencies = []
-    for _ in range(runs):
-        t0 = time.perf_counter()
-        sess.run(None, {input_name: dummy_input})
-        latencies.append((time.perf_counter() - t0) * 1000)  # ms
+```
+Op type summary — before vs after dead node elimination (ResNet-50):
 
-    p50 = float(np.percentile(latencies, 50))
-    p99 = float(np.percentile(latencies, 99))
-    throughput = round(1000 / p50 * dummy_input.shape[0], 1)
-    gpu_mem = round(_gpu_memory_mb(), 1)
+               Before    After
+Conv              53       53
+Relu              49       49
+Add               16       16
+Shape              1        1
+MaxPool            1        1
+ReduceMean         1        1
+Concat             1        1
+Reshape            1        1
+Gemm               1        1
+─────────────────────────────
+Total            124      124
 
-    return {
-        "p50":        round(p50, 2),
-        "p99":        round(p99, 2),
-        "throughput": throughput,
-        "gpu_mem_mb": gpu_mem,
-    }
+Op type summary — before vs after dead node elimination (MobileNetV2, post-fold):
 
-# ---------------------------------------------------------------------------
+               Before    After
+Conv              52       52
+Clip              35       35
+Add               10       10
+Sub                1        1
+Div                1        1
+GlobalAvgPool      1        1
+Flatten            1        1
+Gemm               1        1
+─────────────────────────────
+Total            102      102
+```
 
-# Main benchmark entry point
+**Key finding: 0 eliminated is the correct result.** Both models are already clean after upstream passes. In ResNet-50, `Shape → Reshape` feeds into the live `Gemm` classifier head; it is not orphaned. In MobileNetV2, the 70 `Constant` nodes are harvested directly by the constant folding pre-sweep before they can become orphaned nodes in the first place. Dead node elimination provides a correctness guarantee: after the full pipeline runs, no unreachable nodes remain in either graph.
 
-# ---------------------------------------------------------------------------
+![Dead Node Elimination — ResNet-50 (post-fusion)](images/graphs/resnet50_dead_node.png)
 
-def run_benchmark(ir: dict, model_name: str = "model") -> dict:
-"""
-Benchmark the model under FP32, FP16, and TensorRT providers.
+---
 
-    Args:
-        ir:         Optimized IR dict (used to resolve model path).
-        model_name: "resnet50" or "mobilenetv2" — selects the ONNX file.
+## Key Findings
 
-    Returns:
-        {"rows": [...]} matching the summary table format in pipeline.py.
-    """
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        return _stub_result()
+**BatchNorm folding:** PyTorch's ONNX exporter folds BatchNorm weights into Conv kernels at export time. The expected Conv+BN+Relu pattern does not appear in the graph; only Conv+Relu does. Discovered by inspecting the IR op summary, not assumed upfront.
 
-    available = ort.get_available_providers()
-    if "CUDAExecutionProvider" not in available:
-        print("  [benchmark] CUDAExecutionProvider not available — skipping")
-        return _stub_result()
+**Residual connections constrain fusion:** The 16 Relu nodes that follow Add nodes (residual branch merges) cannot be fused with Conv using the same pattern. The fusion pass detects this correctly by checking the producer op before fusing.
 
-    path_map = {
-        "resnet50":    "models/resnet50.onnx",
-        "mobilenetv2": "models/mobilenetv2_normalized.onnx",
-    }
-    onnx_path = path_map.get(model_name)
-    if onnx_path is None:
-        return _stub_result()
+**ONNX has two constant representations:** Compile-time constants appear either as graph initializers or as inline `Constant` nodes. A constant folding pass must handle both. Discovered by running the pass on MobileNetV2 and getting 0 folded despite visible constant ops: the constants were nodes, not initializer entries.
 
-    dummy = np.random.randn(1, 3, 224, 224).astype(np.float32)
-    input_name = "input"
-    rows = []
+**Graph structure determines what can be folded, not assumptions:** ResNet-50 has no foldable constant subgraph because normalization lives outside the ONNX graph boundary. MobileNetV2 with `register_buffer()` normalization does. The pass is identical; the model structure is what changes the result.
 
-    # --- FP32 ---------------------------------------------------------------
-    print(f"  [benchmark] {model_name} FP32 (CUDA)...", flush=True)
-    r = _benchmark_provider(
-        onnx_path=onnx_path,
-        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-        provider_options=[{}, {}],
-        input_name=input_name,
-        dummy_input=dummy,
-    )
-    rows.append(_format_row("FP32", r))
-    _print_row("FP32", r)
+**Dead node elimination proves graph cleanliness, not just removes nodes:** After the full optimization pipeline, both models contain zero unreachable nodes. The iterative convergence design correctly handles chains: if upstream passes were to orphan a subgraph, the pass would unravel it round by round until nothing remained.
 
-    # --- FP16 ---------------------------------------------------------------
-    print(f"  [benchmark] {model_name} FP16 (CUDA)...", flush=True)
-    r = _benchmark_provider(
-        onnx_path=onnx_path,
-        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-        provider_options=[{"cudnn_conv_algo_search": "DEFAULT"}, {}],
-        input_name=input_name,
-        dummy_input=dummy,
-    )
-    rows.append(_format_row("FP16", r))
-    _print_row("FP16", r)
+---
 
-    # --- TRT ----------------------------------------------------------------
-    if "TensorrtExecutionProvider" in available:
-        print(f"  [benchmark] {model_name} TRT (TensorrtExecutionProvider)...", flush=True)
-        trt_opts = {
-            "trt_fp16_enable": "0",
-            "trt_engine_cache_enable": "1",
-            "trt_engine_cache_path": f"/tmp/trt_cache_{model_name}",
-        }
-        r = _benchmark_provider(
-            onnx_path=onnx_path,
-            providers=["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"],
-            provider_options=[trt_opts, {}, {}],
-            input_name=input_name,
-            dummy_input=dummy,
-            warmup=10,
-            runs=100,
-        )
-        rows.append(_format_row("TRT", r))
-        _print_row("TRT", r)
-    else:
-        rows.append(_tbd_row("TRT"))
+## Benchmark Results
 
-    return {"rows": rows}
+Measured on NVIDIA A100-SXM4-80GB, batch size 1, ONNX Runtime 1.26 with CUDAExecutionProvider and TensorrtExecutionProvider.
 
-# ---------------------------------------------------------------------------
+### Graph Optimization
 
-# Formatting helpers
+| Model       | Pass                  | Nodes Before | Nodes After | Eliminated |
+| ----------- | --------------------- | ------------ | ----------- | ---------- |
+| ResNet-50   | Conv+Relu Fusion      | 124          | 91          | 33 (27%)   |
+| ResNet-50   | Dead Node Elimination | 91           | 91          | 0 ✓        |
+| MobileNetV2 | Constant Folding      | 172          | 102         | 70 (41%)   |
+| MobileNetV2 | Dead Node Elimination | 102          | 102         | 0 ✓        |
 
-# ---------------------------------------------------------------------------
+### Inference Latency (A100-SXM4-80GB)
 
-def \_format_row(precision: str, r: dict) -> dict:
-if "error" in r:
-return \_tbd_row(precision)
-return {
-"precision": precision,
-"p50": f"{r['p50']:.2f}",
-"p99": f"{r['p99']:.2f}",
-"throughput": f"{r['throughput']:.0f}",
-"gpu_mem": f"{r['gpu_mem_mb']:.0f} MB",
-}
+| Model       | Provider | p50 (ms) | p99 (ms) | Throughput (img/s) |
+| ----------- | -------- | -------- | -------- | ------------------ |
+| ResNet-50   | FP32     | 1.85     | 2.02     | 540                |
+| ResNet-50   | TRT      | 1.86     | 1.87     | 539                |
+| ResNet-50   | FP16     | —        | —        | —                  |
+| MobileNetV2 | FP32     | 1.08     | 1.09     | 926                |
+| MobileNetV2 | TRT      | 1.08     | 1.21     | 928                |
+| MobileNetV2 | FP16     | —        | —        | —                  |
 
-def \_print_row(precision: str, r: dict):
-if "error" in r:
-print(f" {precision} failed: {r['error']}", flush=True)
-else:
-print(f" p50={r['p50']:.2f}ms p99={r['p99']:.2f}ms "
-f"throughput={r['throughput']:.0f} img/s "
-f"mem={r['gpu_mem_mb']:.0f}MB", flush=True)
+FP16 rows require prior conversion of model weights to FP16 via `onnxconverter-common`; running FP32 weights through the FP16 provider produces incorrect fallback numbers and is omitted. True FP16 benchmarking is a planned next step.
 
-def \_tbd_row(precision: str) -> dict:
-return {
-"precision": precision,
-"p50": "TBD",
-"p99": "TBD",
-"throughput": "TBD",
-"gpu_mem": "TBD",
-}
+![pipeline.py benchmark output on A100](benchmark/benchmark_results.png)
 
-def \_stub_result() -> dict:
-return {"rows": [\_tbd_row(p) for p in ["FP32", "FP16", "TRT"]]}
+---
 
-# ---------------------------------------------------------------------------
+## Project Structure
 
-# Standalone entry point
+```
+NNGraphFuse/
+├── models/                  # exported ONNX files (gitignored)
+├── images/
+│   └── graphs/              # before/after graph diff PNGs + visualization notes
+├── graph/
+│   ├── ir.py                # ONNX → custom IR parser (load_ir + legacy load_graph shim)
+│   └── visualize.py         # graph diff visualization (before/after)
+├── passes/
+│   ├── fusion.py            # Conv+Relu fusion pass
+│   ├── constant_fold.py     # constant folding pass (with Constant node pre-sweep)
+│   └── dead_node.py         # dead node elimination pass (iterative, convergence-based)
+├── benchmark/
+│   ├── runner.py            # ONNX Runtime GPU benchmark (CUDA + TRT providers)
+│   └── benchmark_results.png  # pipeline.py output on NVIDIA A100-SXM4-80GB
+├── export_model.py          # ResNet-50 → ONNX export
+├── export_mobilenet.py      # MobileNetV2 (normalized) → ONNX export
+├── pipeline.py              # main entry point: runs all passes, prints summary
+└── requirements.txt
+```
 
-# ---------------------------------------------------------------------------
+---
 
-if **name** == "**main**":
-print("Running benchmark standalone on ResNet-50...\n")
-result = run_benchmark({}, model_name="resnet50")
-print("\nResults:")
-for row in result["rows"]:
-print(f" {row['precision']:<6} p50={row['p50']}ms p99={row['p99']}ms "
-f"throughput={row['throughput']} img/s mem={row['gpu_mem']}")
+## Getting Started
+
+```bash
+# 1. Clone and set up environment
+git clone https://github.com/CatNinjaLuna/NNGraphFuse
+cd NNGraphFuse
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+
+# 2. Export models to ONNX
+python export_model.py            # ResNet-50
+python export_mobilenet.py        # MobileNetV2 with baked-in normalization
+
+# 3. Load and inspect the graph IR
+python graph/ir.py
+
+# 4. Run individual passes
+python -m passes.fusion           # Conv+Relu fusion (ResNet-50)
+python -m passes.constant_fold    # constant folding (MobileNetV2)
+python -m passes.dead_node        # dead node elimination (both models)
+
+# 5. Run graph visualizations
+python -m graph.visualize         # generates images/graphs/*.png
+
+# 6. Run full optimization pipeline + benchmark (requires GPU)
+python pipeline.py                # both models
+python pipeline.py --model resnet
+python pipeline.py --model mobilenet
+```
+
+---
+
+## Requirements
+
+- Python 3.10+
+- `torch`, `torchvision`, `onnx`, `onnxruntime-gpu`, `numpy`
+- `networkx`, `matplotlib`
+- CUDA 12+ with cuDNN 9+
+- GPU required for benchmark runs (tested on NVIDIA A100-SXM4-80GB)
+
+Local development (graph manipulation, IR, pass logic) runs CPU-only. GPU is only required for benchmark runs.
+
+---
+
+## Technical Background
+
+This project mirrors the internal pipeline of a production graph compiler:
+
+- **Clang** parses C++ → AST → LLVM IR → optimization passes → machine code
+- **TensorRT** parses ONNX → internal IR → fusion/optimization passes → CUDA kernels
+- **NNGraphFuse** parses ONNX → custom IR → explicit passes → ORT/TRT engine → benchmark
+
+The passes implemented here correspond directly to what TRT's graph optimizer does internally, making the implicit explicit.
+
+---
+
+## Milestones
+
+```
+✅ Phase 1 — Project Setup
+   ✅ Folder structure
+   ✅ Virtual environment
+   ✅ ResNet-50 exported to ONNX
+   ✅ MobileNetV2 (normalized) exported to ONNX
+
+✅ Phase 2 — Graph IR
+   ✅ ONNX parser (load_ir: list-based nodes + initializer dict)
+   ✅ Op summary
+   ✅ Discovered BN folding
+   ✅ Legacy load_graph shim for backward compatibility
+
+✅ Phase 3 — Optimization Passes
+   ✅ Conv + Relu Fusion (33 nodes eliminated, ResNet-50)
+   ✅ Constant Folding (70 nodes eliminated, MobileNetV2)
+      ✅ Constant node pre-sweep
+      ✅ Unused initializer cleanup
+   ✅ Dead Node Elimination (0 eliminated: correctness guarantee confirmed)
+
+✅ Phase 4 — Graph Visualization
+   ✅ Before/after graph diff (networkx, cluster-based summary)
+   ⬜ Latency waterfall chart
+
+✅ Phase 5 — Benchmark (NVIDIA A100-SXM4-80GB)
+   ✅ FP32 inference: ResNet-50 1.85ms p50, 540 img/s
+   ✅ FP32 inference: MobileNetV2 1.08ms p50, 926 img/s
+   ✅ TRT inference: ResNet-50 1.86ms p50, 539 img/s
+   ✅ TRT inference: MobileNetV2 1.08ms p50, 928 img/s
+   ⬜ FP16 inference (requires FP16 model weight conversion)
+
+✅ Phase 6 — Polish
+   ✅ pipeline.py (runs all passes end to end, --model flag, summary table)
+   ⬜ requirements.txt finalized
+   ⬜ GitHub README final
+```
+
+---
+
+## Concepts Covered
+
+**Operator fusion: when does TRT fuse automatically vs. when do you force it?**
+
+TRT automatically fuses patterns it has built-in support for: Conv+BN+Relu, element-wise ops after Conv, and select attention patterns. This happens internally during `builder.build_engine()`. You force fusion when TRT does not recognize the pattern (custom ops, unusual topology, or ops that cross plugin boundaries), either by writing a TensorRT plugin or by pre-optimizing the graph before TRT sees it. NNGraphFuse implements the latter: a pre-TRT fusion pass that rewires the graph so TRT receives a cleaner input.
+
+---
+
+**Horizontal vs. vertical fusion: Conv+BN+Relu as the canonical example**
+
+Vertical fusion merges ops along the data flow path, one feeding into the next (Conv → Relu). This is what NNGraphFuse implements. Horizontal fusion merges ops that run in parallel on independent data (parallel Conv branches in Inception, or MoE expert layers). Conv+BN+Relu is the canonical vertical fusion example because it appears in nearly every CNN block and the memory bandwidth savings are directly measurable. In ResNet-50, BN was already folded into Conv weights by the ONNX exporter, discovered by inspecting the IR, making Conv+Relu the actual fusion target.
+
+---
+
+**Constant folding: compile-time vs. runtime computation**
+
+Constant folding moves computation from runtime to compile time. Nodes whose inputs are all statically known can be evaluated once during graph compilation and replaced with their result: the op disappears from the graph TRT receives. In NNGraphFuse, 70 inline `Constant` nodes in MobileNetV2 were eliminated this way. The key implementation detail: ONNX represents compile-time constants in two places (the initializer table and inline `Constant` nodes), and a correct pass must harvest both before scanning for foldable consumers.
+
+---
+
+**Dead node elimination: correctness guarantee over graph cleanliness**
+
+Dead node elimination removes nodes whose outputs are never consumed downstream and are not graph-level outputs. The pass runs iteratively until convergence: a single forward scan cannot unravel a chain of orphaned nodes (A → B → C) in one pass, because B and C only become dead after A is removed. In NNGraphFuse, both ResNet-50 and MobileNetV2 report 0 dead nodes after the full pipeline, confirming that upstream passes leave no unreachable subgraphs. The result is a correctness guarantee: the pass ran, the graph is clean.
+
+---
+
+**Structured vs. unstructured pruning: Ampere/Hopper 2:4 sparsity**
+
+Unstructured pruning zeros individual weights anywhere in the matrix. It achieves high sparsity but produces irregular memory access patterns that standard GPU hardware cannot exploit efficiently. Structured pruning removes entire filters or channels, producing a smaller dense matrix that hardware handles natively; it is easier to deploy but coarser grained. NVIDIA's 2:4 structured sparsity (Ampere+) sits between the two: exactly 2 of every 4 consecutive weights must be zero, producing regular enough structure for Sparse Tensor Cores to decompress and multiply in one step, delivering approximately 2x throughput at exactly 50% sparsity. The tradeoff: requires retraining or fine-tuning with the sparsity constraint enforced; you cannot prune a dense model post-hoc and expect the hardware speedup.
+
+---
+
+**The roofline model applied to fused vs. unfused graphs**
+
+The roofline model bounds kernel performance by two limits: peak compute (FLOPS) and peak memory bandwidth (GB/s). Relu is almost purely memory bound: minimal arithmetic, full DRAM read and write. Unfused, it sits far left on the roofline (bandwidth limited, compute underutilized). Conv is more compute bound, with high arithmetic intensity from multiply-accumulates. Fused, the Relu executes inside the Conv kernel: intermediate values stay in registers, no additional DRAM transaction occurs, and the fused kernel's arithmetic intensity shifts right toward the compute roof. Nsight Systems confirms this directly; fused kernels show higher arithmetic intensity and fewer memory transactions per inference pass.
