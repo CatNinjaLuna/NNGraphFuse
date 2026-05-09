@@ -170,6 +170,14 @@ Total            102      102
 
 Measured on NVIDIA A100-SXM4-80GB, batch size 1, ONNX Runtime 1.26 with CUDAExecutionProvider and TensorrtExecutionProvider.
 
+### Node Reduction Waterfall
+
+The waterfall chart shows cumulative node count reduction across the full optimization pipeline for each model. Each bar represents the graph state after one pass. The blue portion is surviving nodes; the red portion stacked on top is nodes eliminated by that pass. The dashed connector line carries the surviving count forward to the next stage.
+
+ResNet-50 loses all its reduction in a single pass — Conv+Relu Fusion eliminates 33 nodes at once, and Dead Node Elimination confirms the graph is already clean. MobileNetV2 follows the same pattern: Constant Folding absorbs 70 nodes in one pass, Dead Node Elimination finds nothing further to remove. In both cases the reduction is front-loaded into the primary pass, which is expected — dead node elimination is a correctness check, not a primary optimization.
+
+![Node reduction waterfall](images/graphs/waterfall.png)
+
 ### Graph Optimization
 
 | Model       | Pass                  | Nodes Before | Nodes After | Eliminated |
@@ -200,10 +208,11 @@ FP16 benchmarking requires prior model weight conversion and is a planned extens
 NNGraphFuse/
 ├── models/                  # exported ONNX files (gitignored)
 ├── images/
-│   └── graphs/              # before/after graph diff PNGs + visualization notes
+│   └── graphs/              # before/after graph diff PNGs + waterfall chart
 ├── graph/
 │   ├── ir.py                # ONNX → custom IR parser (load_ir + legacy load_graph shim)
-│   └── visualize.py         # graph diff visualization (before/after)
+│   ├── visualize.py         # graph diff visualization (before/after)
+│   └── waterfall.py         # node reduction waterfall chart
 ├── passes/
 │   ├── fusion.py            # Conv+Relu fusion pass
 │   ├── constant_fold.py     # constant folding pass (with Constant node pre-sweep)
@@ -241,7 +250,8 @@ python -m passes.constant_fold    # constant folding (MobileNetV2)
 python -m passes.dead_node        # dead node elimination (both models)
 
 # 5. Run graph visualizations
-python -m graph.visualize         # generates images/graphs/*.png
+python -m graph.visualize         # before/after graph diff PNGs
+python -m graph.waterfall         # node reduction waterfall chart
 
 # 6. Run full optimization pipeline + benchmark (requires GPU)
 python pipeline.py                # both models
@@ -299,7 +309,7 @@ The passes implemented here correspond directly to what TRT's graph optimizer do
 
 ✅ Phase 4 — Graph Visualization
    ✅ Before/after graph diff (networkx, cluster-based summary)
-   ⬜ Latency waterfall chart
+   ✅ Node reduction waterfall chart
 
 ✅ Phase 5 — Benchmark (NVIDIA A100-SXM4-80GB)
    ✅ FP32 inference: ResNet-50 1.85ms p50, 540 img/s
