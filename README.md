@@ -74,6 +74,10 @@ Total            124       91
 
 Without fusion, each op is a separate kernel launch: the intermediate tensor between Conv and Relu gets written to DRAM and read back. Fusing them means the Relu runs inside the same kernel, intermediate values stay in registers or L2 cache, and never touch DRAM.
 
+![Conv + Relu Fusion — ResNet-50](images/graphs/resnet50_fusion.png)
+
+---
+
 ### Constant Folding ✅
 
 Scans the IR for nodes whose inputs are all compile-time constants, evaluates them with numpy at compile time, and removes them from the graph. TRT never sees these nodes during engine build.
@@ -102,6 +106,10 @@ Total            172      102
 **Key finding: two representations of constants in ONNX.** The ONNX exporter can represent compile-time constants either as graph initializers (the initializer table) or as inline `Constant` nodes in the node list. A naive pass that only seeds from initializers misses the inline nodes entirely. The fix is a pre-sweep that harvests all `Constant` nodes into the constant value table before the main scan runs, which is standard in production compilers like TorchInductor and XLA.
 
 **Why Sub and Div remain:** Normalization ops (`x - mean`, `x / std`) take `input` (the live image tensor) as their first operand. They touch runtime data by definition and cannot be folded. Keeping them is correct behavior.
+
+![Constant Folding — MobileNetV2](images/graphs/mobilenet_fold.png)
+
+---
 
 ### Dead Node Elimination ✅
 
@@ -142,6 +150,8 @@ Total            102      102
 
 **Key finding: 0 eliminated is the correct result.** Both models are already clean after upstream passes. In ResNet-50, `Shape → Reshape` feeds into the live `Gemm` classifier head; it is not orphaned. In MobileNetV2, the 70 `Constant` nodes are harvested directly by the constant folding pre-sweep before they can become orphaned nodes in the first place. Dead node elimination provides a correctness guarantee: after the full pipeline runs, no unreachable nodes remain in either graph.
 
+![Dead Node Elimination — ResNet-50 (post-fusion)](images/graphs/resnet50_dead_node.png)
+
 ---
 
 ## Key Findings
@@ -179,7 +189,8 @@ Latency p50/p99, throughput, and GPU memory columns to be filled after A100 clus
 ```
 NNGraphFuse/
 ├── models/                  # exported ONNX files (gitignored)
-├── images/                  # test images (ImageNet validation subset)
+├── images/
+│   └── graphs/              # before/after graph diff PNGs + visualization notes
 ├── graph/
 │   ├── ir.py                # ONNX → custom IR parser (load_ir + legacy load_graph shim)
 │   └── visualize.py         # graph diff visualization (before/after)
@@ -218,7 +229,10 @@ python -m passes.fusion           # Conv+Relu fusion (ResNet-50)
 python -m passes.constant_fold    # constant folding (MobileNetV2)
 python -m passes.dead_node        # dead node elimination (both models)
 
-# 5. Run full optimization pipeline
+# 5. Run graph visualizations
+python -m graph.visualize         # generates images/graphs/*.png
+
+# 6. Run full optimization pipeline
 python pipeline.py                # both models
 python pipeline.py --model resnet
 python pipeline.py --model mobilenet
@@ -272,9 +286,9 @@ The passes implemented here correspond directly to what TRT's graph optimizer do
       ✅ Unused initializer cleanup
    ✅ Dead Node Elimination (0 eliminated: correctness guarantee confirmed)
 
-⬜ Phase 4 — Graph Visualization
-   ⬜ Before/after graph diff (networkx)
-   ⬜ Latency waterfall chart
+✅ Phase 4 — Graph Visualization
+   ✅ Before/after graph diff (networkx, cluster-based summary)
+   ⬜ Latency waterfall chart (pending A100 benchmark runs)
 
 ⬜ Phase 5 — TensorRT Benchmark (university cluster)
    ⬜ Baseline TRT engine build
