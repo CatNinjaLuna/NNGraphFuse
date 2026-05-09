@@ -6,7 +6,7 @@
 
 ## What it does
 
-NNGraphFuse loads a neural network's computation graph (ONNX), parses it into a custom IR, applies a sequence of optimization passes — operator fusion, constant folding, dead node elimination — then rebuilds a TensorRT engine and benchmarks latency improvement on real image inference.
+NNGraphFuse loads a neural network's computation graph (ONNX), parses it into a custom IR, applies a sequence of optimization passes (operator fusion, constant folding, dead node elimination), then rebuilds a TensorRT engine and benchmarks latency improvement on real image inference.
 
 The core idea: the same computation graph can run significantly faster if you rewrite it before handing it to the runtime. NNGraphFuse makes each optimization pass explicit and measurable.
 
@@ -14,7 +14,7 @@ The core idea: the same computation graph can run significantly faster if you re
 
 ## Why this exists
 
-TensorRT is a graph compiler. It takes a model graph, rewrites it for efficiency, and generates GPU kernels. This project implements a simplified version of that pipeline from scratch — not to replace TensorRT, but to understand it from the inside.
+TensorRT is a graph compiler. It takes a model graph, rewrites it for efficiency, and generates GPU kernels. This project implements a simplified version of that pipeline from scratch: not to replace TensorRT, but to understand it from the inside.
 
 Building the passes manually forces the question: _why does fusing Conv+Relu matter?_ The answer shows up in the benchmark numbers.
 
@@ -49,7 +49,7 @@ Benchmark Report  (latency p50/p99, throughput, memory, node count)
 
 ### Conv + Relu Fusion ✅
 
-ResNet-50 exports with BatchNorm already folded into Conv weights by the ONNX exporter — discovered by inspecting the IR directly. The dominant fusion target is therefore Conv + Relu.
+ResNet-50 exports with BatchNorm already folded into Conv weights by the ONNX exporter, discovered by inspecting the IR directly. The dominant fusion target is therefore Conv + Relu.
 
 The pass scans the IR for Conv nodes whose output feeds directly into a Relu, rewires the Conv to produce the Relu's output, and removes the Relu node. Of 49 Relu nodes in the graph, 33 are fused. The remaining 16 follow Add nodes (residual branch merges) rather than Conv nodes and are correctly skipped.
 
@@ -72,7 +72,7 @@ Gemm               1        1
 Total            124       91
 ```
 
-Without fusion, each op is a separate kernel launch — the intermediate tensor between Conv and Relu gets written to DRAM and read back. Fusing them means the Relu runs inside the same kernel, intermediate values stay in registers or L2 cache, and never touch DRAM.
+Without fusion, each op is a separate kernel launch: the intermediate tensor between Conv and Relu gets written to DRAM and read back. Fusing them means the Relu runs inside the same kernel, intermediate values stay in registers or L2 cache, and never touch DRAM.
 
 ### Constant Folding ✅
 
@@ -99,9 +99,9 @@ Gemm               1        1
 Total            172      102
 ```
 
-**Key finding — two representations of constants in ONNX:** The ONNX exporter can represent compile-time constants either as graph initializers (the initializer table) or as inline `Constant` nodes in the node list. A naive pass that only seeds from initializers misses the inline nodes entirely. The fix is a pre-sweep that harvests all `Constant` nodes into the constant value table before the main scan runs — standard in production compilers like TorchInductor and XLA.
+**Key finding: two representations of constants in ONNX.** The ONNX exporter can represent compile-time constants either as graph initializers (the initializer table) or as inline `Constant` nodes in the node list. A naive pass that only seeds from initializers misses the inline nodes entirely. The fix is a pre-sweep that harvests all `Constant` nodes into the constant value table before the main scan runs, which is standard in production compilers like TorchInductor and XLA.
 
-**Why Sub and Div remain:** Normalization ops (`x - mean`, `x / std`) have `input` — the live image tensor — as their first operand. They touch runtime data by definition and cannot be folded. Keeping them is correct behavior.
+**Why Sub and Div remain:** Normalization ops (`x - mean`, `x / std`) take `input` (the live image tensor) as their first operand. They touch runtime data by definition and cannot be folded. Keeping them is correct behavior.
 
 ### Dead Node Elimination ✅
 
@@ -140,21 +140,21 @@ Gemm               1        1
 Total            102      102
 ```
 
-**Key finding — 0 eliminated is the correct result:** Both models are already clean after upstream passes. In ResNet-50, `Shape → Reshape` feeds into the live `Gemm` classifier head — it is not orphaned. In MobileNetV2, the 70 `Constant` nodes are harvested directly by the constant folding pre-sweep before they can become orphaned nodes in the first place. Dead node elimination provides a correctness guarantee: after the full pipeline runs, no unreachable nodes remain in either graph.
+**Key finding: 0 eliminated is the correct result.** Both models are already clean after upstream passes. In ResNet-50, `Shape → Reshape` feeds into the live `Gemm` classifier head; it is not orphaned. In MobileNetV2, the 70 `Constant` nodes are harvested directly by the constant folding pre-sweep before they can become orphaned nodes in the first place. Dead node elimination provides a correctness guarantee: after the full pipeline runs, no unreachable nodes remain in either graph.
 
 ---
 
 ## Key Findings
 
-**BatchNorm folding:** PyTorch's ONNX exporter folds BatchNorm weights into Conv kernels at export time. The expected Conv+BN+Relu pattern does not appear in the graph — only Conv+Relu. Discovered by inspecting the IR op summary, not assumed upfront.
+**BatchNorm folding:** PyTorch's ONNX exporter folds BatchNorm weights into Conv kernels at export time. The expected Conv+BN+Relu pattern does not appear in the graph; only Conv+Relu does. Discovered by inspecting the IR op summary, not assumed upfront.
 
 **Residual connections constrain fusion:** The 16 Relu nodes that follow Add nodes (residual branch merges) cannot be fused with Conv using the same pattern. The fusion pass detects this correctly by checking the producer op before fusing.
 
-**ONNX has two constant representations:** Compile-time constants appear either as graph initializers or as inline `Constant` nodes. A constant folding pass must handle both. Discovered by running the pass on MobileNetV2 and getting 0 folded despite visible constant ops — the constants were nodes, not initializer entries.
+**ONNX has two constant representations:** Compile-time constants appear either as graph initializers or as inline `Constant` nodes. A constant folding pass must handle both. Discovered by running the pass on MobileNetV2 and getting 0 folded despite visible constant ops: the constants were nodes, not initializer entries.
 
-**Graph structure determines what can be folded — not assumptions:** ResNet-50 has no foldable constant subgraph because normalization lives outside the ONNX graph boundary. MobileNetV2 with `register_buffer()` normalization does. The pass is identical; the model structure is what changes the result.
+**Graph structure determines what can be folded, not assumptions:** ResNet-50 has no foldable constant subgraph because normalization lives outside the ONNX graph boundary. MobileNetV2 with `register_buffer()` normalization does. The pass is identical; the model structure is what changes the result.
 
-**Dead node elimination proves graph cleanliness, not just removes nodes:** After the full optimization pipeline, both models contain zero unreachable nodes. The iterative convergence design correctly handles chains — if upstream passes were to orphan a subgraph, the pass would unravel it round by round until nothing remained.
+**Dead node elimination proves graph cleanliness, not just removes nodes:** After the full optimization pipeline, both models contain zero unreachable nodes. The iterative convergence design correctly handles chains: if upstream passes were to orphan a subgraph, the pass would unravel it round by round until nothing remained.
 
 ---
 
@@ -191,7 +191,7 @@ NNGraphFuse/
 │   └── runner.py            # latency/throughput/memory profiling (stubbed, pending A100)
 ├── export_model.py          # ResNet-50 → ONNX export
 ├── export_mobilenet.py      # MobileNetV2 (normalized) → ONNX export
-├── pipeline.py              # main entry point — runs all passes, prints summary
+├── pipeline.py              # main entry point: runs all passes, prints summary
 └── requirements.txt
 ```
 
@@ -246,7 +246,7 @@ This project mirrors the internal pipeline of a production graph compiler:
 - **TensorRT** parses ONNX → internal IR → fusion/optimization passes → CUDA kernels
 - **NNGraphFuse** parses ONNX → custom IR → explicit passes → TRT engine → benchmark
 
-The passes implemented here correspond directly to what TRT's graph optimizer does internally — making the implicit explicit.
+The passes implemented here correspond directly to what TRT's graph optimizer does internally, making the implicit explicit.
 
 ---
 
@@ -270,7 +270,7 @@ The passes implemented here correspond directly to what TRT's graph optimizer do
    ✅ Constant Folding (70 nodes eliminated, MobileNetV2)
       ✅ Constant node pre-sweep
       ✅ Unused initializer cleanup
-   ✅ Dead Node Elimination (0 eliminated — correctness guarantee confirmed)
+   ✅ Dead Node Elimination (0 eliminated: correctness guarantee confirmed)
 
 ⬜ Phase 4 — Graph Visualization
    ⬜ Before/after graph diff (networkx)
@@ -293,34 +293,34 @@ The passes implemented here correspond directly to what TRT's graph optimizer do
 
 **Operator fusion: when does TRT fuse automatically vs. when do you force it?**
 
-TRT automatically fuses patterns it has built-in support for — Conv+BN+Relu, element-wise ops after Conv, and select attention patterns. This happens internally during `builder.build_engine()`. You force fusion when TRT does not recognize the pattern — custom ops, unusual topology, or ops that cross plugin boundaries — either by writing a TensorRT plugin or by pre-optimizing the graph before TRT sees it. NNGraphFuse implements the latter: a pre-TRT fusion pass that rewires the graph so TRT receives a cleaner input.
+TRT automatically fuses patterns it has built-in support for: Conv+BN+Relu, element-wise ops after Conv, and select attention patterns. This happens internally during `builder.build_engine()`. You force fusion when TRT does not recognize the pattern (custom ops, unusual topology, or ops that cross plugin boundaries), either by writing a TensorRT plugin or by pre-optimizing the graph before TRT sees it. NNGraphFuse implements the latter: a pre-TRT fusion pass that rewires the graph so TRT receives a cleaner input.
 
 ---
 
-**Horizontal vs. vertical fusion — Conv+BN+Relu as the canonical example**
+**Horizontal vs. vertical fusion: Conv+BN+Relu as the canonical example**
 
-Vertical fusion merges ops along the data flow path, one feeding into the next (Conv → Relu). This is what NNGraphFuse implements. Horizontal fusion merges ops that run in parallel on independent data — parallel Conv branches in Inception, or MoE expert layers. Conv+BN+Relu is the canonical vertical fusion example because it appears in nearly every CNN block and the memory bandwidth savings are directly measurable. In ResNet-50, BN was already folded into Conv weights by the ONNX exporter — discovered by inspecting the IR — making Conv+Relu the actual fusion target.
+Vertical fusion merges ops along the data flow path, one feeding into the next (Conv → Relu). This is what NNGraphFuse implements. Horizontal fusion merges ops that run in parallel on independent data (parallel Conv branches in Inception, or MoE expert layers). Conv+BN+Relu is the canonical vertical fusion example because it appears in nearly every CNN block and the memory bandwidth savings are directly measurable. In ResNet-50, BN was already folded into Conv weights by the ONNX exporter, discovered by inspecting the IR, making Conv+Relu the actual fusion target.
 
 ---
 
 **Constant folding: compile-time vs. runtime computation**
 
-Constant folding moves computation from runtime to compile time. Nodes whose inputs are all statically known can be evaluated once during graph compilation and replaced with their result — the op disappears from the graph TRT receives. In NNGraphFuse, 70 inline `Constant` nodes in MobileNetV2 were eliminated this way. The key implementation detail: ONNX represents compile-time constants in two places — the initializer table and inline `Constant` nodes — and a correct pass must harvest both before scanning for foldable consumers.
+Constant folding moves computation from runtime to compile time. Nodes whose inputs are all statically known can be evaluated once during graph compilation and replaced with their result: the op disappears from the graph TRT receives. In NNGraphFuse, 70 inline `Constant` nodes in MobileNetV2 were eliminated this way. The key implementation detail: ONNX represents compile-time constants in two places (the initializer table and inline `Constant` nodes), and a correct pass must harvest both before scanning for foldable consumers.
 
 ---
 
 **Dead node elimination: correctness guarantee over graph cleanliness**
 
-Dead node elimination removes nodes whose outputs are never consumed downstream and are not graph-level outputs. The pass runs iteratively until convergence — a single forward scan cannot unravel a chain of orphaned nodes (A → B → C) in one pass, because B and C only become dead after A is removed. In NNGraphFuse, both ResNet-50 and MobileNetV2 report 0 dead nodes after the full pipeline, confirming that upstream passes leave no unreachable subgraphs. The result is a correctness guarantee: the pass ran, the graph is clean.
+Dead node elimination removes nodes whose outputs are never consumed downstream and are not graph-level outputs. The pass runs iteratively until convergence: a single forward scan cannot unravel a chain of orphaned nodes (A → B → C) in one pass, because B and C only become dead after A is removed. In NNGraphFuse, both ResNet-50 and MobileNetV2 report 0 dead nodes after the full pipeline, confirming that upstream passes leave no unreachable subgraphs. The result is a correctness guarantee: the pass ran, the graph is clean.
 
 ---
 
-**Structured vs. unstructured pruning — Ampere/Hopper 2:4 sparsity**
+**Structured vs. unstructured pruning: Ampere/Hopper 2:4 sparsity**
 
-Unstructured pruning zeros individual weights anywhere in the matrix. It achieves high sparsity but produces irregular memory access patterns that standard GPU hardware cannot exploit efficiently. Structured pruning removes entire filters or channels, producing a smaller dense matrix that hardware handles natively — easier to deploy but coarser grained. NVIDIA's 2:4 structured sparsity (Ampere+) sits between the two: exactly 2 of every 4 consecutive weights must be zero, producing regular enough structure for Sparse Tensor Cores to decompress and multiply in one step, delivering ~2x throughput at exactly 50% sparsity. The tradeoff: requires retraining or fine-tuning with the sparsity constraint enforced — you cannot prune a dense model post-hoc and expect the hardware speedup.
+Unstructured pruning zeros individual weights anywhere in the matrix. It achieves high sparsity but produces irregular memory access patterns that standard GPU hardware cannot exploit efficiently. Structured pruning removes entire filters or channels, producing a smaller dense matrix that hardware handles natively; it is easier to deploy but coarser grained. NVIDIA's 2:4 structured sparsity (Ampere+) sits between the two: exactly 2 of every 4 consecutive weights must be zero, producing regular enough structure for Sparse Tensor Cores to decompress and multiply in one step, delivering approximately 2x throughput at exactly 50% sparsity. The tradeoff: requires retraining or fine-tuning with the sparsity constraint enforced; you cannot prune a dense model post-hoc and expect the hardware speedup.
 
 ---
 
 **The roofline model applied to fused vs. unfused graphs**
 
-The roofline model bounds kernel performance by two limits: peak compute (FLOPS) and peak memory bandwidth (GB/s). Relu is almost purely memory bound — minimal arithmetic, full DRAM read and write. Unfused, it sits far left on the roofline: bandwidth limited, compute underutilized. Conv is more compute bound — high arithmetic intensity from multiply-accumulates. Fused, the Relu executes inside the Conv kernel: intermediate values stay in registers, no additional DRAM transaction occurs, and the fused kernel's arithmetic intensity shifts right toward the compute roof. Nsight Systems confirms this directly — fused kernels show higher arithmetic intensity and fewer memory transactions per inference pass.
+The roofline model bounds kernel performance by two limits: peak compute (FLOPS) and peak memory bandwidth (GB/s). Relu is almost purely memory bound: minimal arithmetic, full DRAM read and write. Unfused, it sits far left on the roofline (bandwidth limited, compute underutilized). Conv is more compute bound, with high arithmetic intensity from multiply-accumulates. Fused, the Relu executes inside the Conv kernel: intermediate values stay in registers, no additional DRAM transaction occurs, and the fused kernel's arithmetic intensity shifts right toward the compute roof. Nsight Systems confirms this directly; fused kernels show higher arithmetic intensity and fewer memory transactions per inference pass.
