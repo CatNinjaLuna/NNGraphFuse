@@ -1,0 +1,19 @@
+# NNGraphFuse requirements
+# Core ML and export
+torch>=2.1.0
+torchvision>=0.16.0
+
+# ONNX graph manipulation
+onnx>=1.15.0
+onnxruntime-gpu>=1.16.0
+
+# Numerical computation (pass evaluation)
+numpy>=1.24.0
+
+# Graph visualization
+networkx>=3.0
+matplotlib>=3.7.0
+
+# TensorRT (optional — required for TensorrtExecutionProvider)
+# pip install tensorrt  (system TRT libs must be installed separately)
+# tensorrt>=10.0
