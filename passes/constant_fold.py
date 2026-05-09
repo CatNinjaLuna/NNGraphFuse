@@ -240,7 +240,7 @@ def run_constant_folding(ir: dict) -> dict:
     }
 
     nodes_after = len(kept_nodes)
-    print(f"\n[constant_fold] {nodes_before} nodes → {nodes_after} nodes  ({folded_count} folded)")
+    #print(f"\n[constant_fold] {nodes_before} nodes → {nodes_after} nodes  ({folded_count} folded)")
 
     return new_ir
 
